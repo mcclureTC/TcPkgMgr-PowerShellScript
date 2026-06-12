@@ -6,9 +6,7 @@ A numeric menu driven PowerShell script for the TwinCAT Package Manager. This Po
 This can be run from the PowerShell ISE or from a command prompt using "powershell -ExecutionPolicy Bypass -File "C:\path\to\your\script.ps1"
 
 
-==============================================================
   TwinCAT Package Manager Console   |   Main menu
-  Mode: LIVE
 
    1. Packages & workloads
    2. Sources (feeds)
@@ -19,5 +17,3 @@ This can be run from the PowerShell ISE or from a command prompt using "powershe
    7. Toggle dry-run mode
    8. Run a raw tcpkg command
    0. Exit
-
-  Choice: 
