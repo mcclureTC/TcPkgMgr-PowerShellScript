@@ -9,7 +9,6 @@ This can be run from the PowerShell ISE or from a command prompt using "powershe
 ==============================================================
   TwinCAT Package Manager Console   |   Main menu
   Mode: LIVE
-==============================================================
 
    1. Packages & workloads
    2. Sources (feeds)
