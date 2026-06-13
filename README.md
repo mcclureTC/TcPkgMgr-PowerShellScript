@@ -1,4 +1,4 @@
-# TcPkg Console
+# TcPkgMgr
 
 A PowerShell ISE menu system for the TwinCAT Package Manager (`tcpkg`).  
 Wraps every `tcpkg` command in a numbered, guided interface with read-only preview mode, remote target management, batch operations, and CSV import/export.
@@ -7,7 +7,7 @@ Wraps every `tcpkg` command in a numbered, guided interface with read-only previ
 
 ## Quick start
 
-1. Open `TcPkgConsole.ps1` in the PowerShell ISE.
+1. Open `TcPkgMgr.ps1` in the PowerShell ISE.
 2. Press **F5** to run.
 3. The script starts in **read-only mode** — all commands are shown but not executed. Use this to explore the menus and verify commands before making changes.
 4. Select **8. Toggle read-only mode** from the main menu when you are ready to execute commands.
