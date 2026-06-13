@@ -1,4 +1,4 @@
-# TcPkgMgr-PowerShellScript
+# TcPkg Console
 
 A PowerShell ISE menu system for the TwinCAT Package Manager (`tcpkg`).  
 Wraps every `tcpkg` command in a numbered, guided interface with read-only preview mode, remote target management, batch operations, and CSV import/export.
@@ -8,8 +8,6 @@ Wraps every `tcpkg` command in a numbered, guided interface with read-only previ
 ## Quick start
 
 1. Open `TcPkgConsole.ps1` in the PowerShell ISE.
-   1. Optional:This can be run from command prompt using "powershell -ExecutionPolicy Bypass -File "C:\path\to\your\script.ps1"
-
 2. Press **F5** to run.
 3. The script starts in **read-only mode** — all commands are shown but not executed. Use this to explore the menus and verify commands before making changes.
 4. Select **8. Toggle read-only mode** from the main menu when you are ready to execute commands.
@@ -64,20 +62,16 @@ flowchart TD
     PKG --> P12["12. Search for a package\ntcpkg list term"]
     PKG --> P13["13. Batch operation\non multiple targets"]
 
-    P8 --> P8A["Single target\n→ Package browser\n→ Pick version\n→ Pick target"]
-    P8 --> P8B["Multiple targets\n→ Batch operation"]
-
-    P9 --> P9A["Single target\n→ Package browser"]
-    P9 --> P9B["Multiple targets\n→ Batch operation"]
-    P9 --> P9C["Upgrade ALL\ntcpkg upgrade all"]
-
+    P8  --> P8A["Single target\n→ Package browser\n→ Pick version\n→ Pick target"]
+    P8  --> P8B["Multiple targets\n→ Batch operation"]
+    P9  --> P9A["Single target\n→ Package browser"]
+    P9  --> P9B["Multiple targets\n→ Batch operation"]
+    P9  --> P9C["Upgrade ALL\ntcpkg upgrade all"]
     P11 --> P11A["Single target\n→ Installed list picker"]
     P11 --> P11B["Multiple targets\n→ Batch operation"]
     P11 --> P11C["Uninstall ALL\ntcpkg uninstall all"]
 
-    P8B & P9B & P11B & P13 --> BATCH
-
-    BATCH["Batch operation\n(see below)"]
+    P8B & P9B & P11B & P13 --> BATCH["Batch operation\n(see below)"]
 
     classDef menu   fill:#1e3a5f,stroke:#4a9eda,color:#fff
     classDef action fill:#1a3a2a,stroke:#4aaf6a,color:#fff
@@ -91,24 +85,31 @@ flowchart TD
 
 #### Batch operation
 
+Runs the same action sequentially across multiple remote targets.  
+Targets are selected using numbers and ranges — both `1,3,5..8` and `1,3,5-8` syntax are supported.
+
+> **Note on parallelism:** tcpkg holds a system-wide lock for the full duration of every command (including the initial compatibility check). Only one tcpkg process can run at a time on the local machine, so true parallel execution is not possible. All batch operations run sequentially.
+
 ```mermaid
 flowchart TD
     BATCH["Batch operation"]
-    BATCH --> BA["1. Install"]
-    BATCH --> BB["2. Upgrade"]
-    BATCH --> BC["3. Uninstall"]
+    BATCH --> BA["1. Install\nSearch feed\nPick package & version"]
+    BATCH --> BB["2. Upgrade\nSearch feed\nPick package"]
+    BATCH --> BC["3. Uninstall\nSearch installed\non a representative target"]
 
-    BA --> BPKGI["Search feed\nPick package & version"]
-    BB --> BPKGU["Search feed\nPick package"]
-    BC --> BPKGX["Search installed on\na representative target\nPick package"]
+    BA --> BFEED["If feed missing on remote\n─────────────────────────\n1. Push from local\n   (Internet Access → False,\n    push over SSH, restore)\n2. Add feed remotely\n   (unauthenticated feeds only;\n    authenticated auto-falls back\n    to push-from-local)\n3. Skip target"]
 
-    BPKGI & BPKGU & BPKGX --> BTGT["Select targets\ne.g. 1,3,5..8"]
-    BTGT --> BRUN["Run sequentially on each target\n─────────────────────────\n• Feed missing → auto push-from-local\n• Internet access toggled & restored\n• Per-target Result: OK / Failed\n• Summary table at end"]
+    BA & BB & BC --> BTGT["Select targets\ne.g. 1,3,5..8 or 1-5"]
+    BFEED --> BTGT
+
+    BTGT --> BRUN["Run sequentially on each target\n─────────────────────────────\n• Per-target status: OK / Skipped / Failed\n• Internet Access restored after each target\n• Summary table on completion"]
 
     classDef batch fill:#3a1e5f,stroke:#9a6eda,color:#fff
     classDef step  fill:#1a3a2a,stroke:#4aaf6a,color:#fff
+    classDef warn  fill:#3a2a1a,stroke:#cf9a4a,color:#fff
     class BATCH batch
-    class BA,BB,BC,BPKGI,BPKGU,BPKGX,BTGT,BRUN step
+    class BA,BB,BC,BTGT,BRUN step
+    class BFEED warn
 ```
 
 </details>
@@ -190,10 +191,10 @@ flowchart TD
     RMT --> R1["1. List remote targets\ntcpkg remote list"]
     RMT --> R2["2. Verify a target\ntcpkg remote verify"]
     RMT --> R3["3. Add a remote target\ntcpkg remote add\n─────────────────\nSSH password via masked prompt\nHost key auto-accepted with -y"]
-    RMT --> R4["4. Edit a remote target\ntcpkg remote edit\n─────────────────\nName · Host · Port · User\nInternet Access · Password"]
+    RMT --> R4["4. Edit a remote target\ntcpkg remote edit\n─────────────────\nName · Host · Port · User\nInternet Access (True/False)"]
     RMT --> R5["5. Remove a remote target\ntcpkg remote remove"]
-    RMT --> R6["6. Export targets to CSV\nColumns: Name Host Port User\nInternetAccess Password"]
-    RMT --> R7["7. Import targets from CSV\n─────────────────\nSkip unreachable hosts\nUpdate changed properties\nPassword: CSV / shared / per-target"]
+    RMT --> R6["6. Export targets to CSV\nColumns: Name Host Port User\nInternetAccess Password (optional)"]
+    RMT --> R7["7. Import targets from CSV\n─────────────────\nConnectivity pre-check per target\nUpdate changed properties\nPassword: CSV / shared / per-target\nSkip unreachable hosts option"]
 
     classDef menu   fill:#1e3a5f,stroke:#4a9eda,color:#fff
     classDef action fill:#1a3a2a,stroke:#4aaf6a,color:#fff
@@ -217,7 +218,7 @@ flowchart TD
     LFS3 --> LFS4["Open containing folder\nin Explorer"]
 
     FFS["7. Search files\nin feed packages"]
-    FFS --> FFS1["Search feed for packages\nPick one or more"]
+    FFS --> FFS1["Search feed for packages\nPick one or more (numbers & ranges)"]
     FFS1 --> FFS2["Enter file search term\nPartial or exact match"]
     FFS2 --> FFS3["Download selected packages\nto temp folder\ntcpkg download --exclude-dependencies"]
     FFS3 --> FFS4["Search inside .nupkg files"]
@@ -238,14 +239,22 @@ flowchart TD
 
 | Feature | Description |
 |---|---|
-| **Read-only mode** | Default at startup — preview every tcpkg command before it runs. Toggle with option 8. |
-| **Package browser** | Browse feeds, see install status per target, pick version from a table with feed column |
-| **Batch operations** | Install / upgrade / uninstall across multiple remote targets in one operation with range selection (`1,3,5..8`) |
-| **Auto push-from-local** | If a remote lacks the required feed, internet access is toggled automatically so the local machine pushes the package over SSH, then restored |
-| **Remote target management** | Add, edit, verify targets; CSV export/import with optional embedded passwords and connectivity pre-check |
+| **Read-only mode** | Default at startup — every tcpkg command is shown but not executed. Toggle with option 8. |
+| **Package browser** | Browse feeds, see install status per target, pick version from a table showing version and feed |
+| **Batch operations** | Install / upgrade / uninstall the same package across multiple remote targets. Targets selected with numbers and ranges (`1,3,5..8` or `1,3,5-8`). Always sequential — tcpkg's system-wide lock prevents parallel execution from one machine. |
+| **Missing feed handling** | When a required feed is not on a remote target, choose per batch: push from local (Internet Access toggled to False and restored), add feed remotely (unauthenticated feeds), or skip the target. Authenticated remote feed add falls back to push-from-local automatically. |
+| **Remote target management** | Add, edit, verify targets via SSH. CSV export/import with optional password column, connectivity pre-check, and automatic property update on import. |
 | **Feed management** | Add Beckhoff feeds, custom feeds, enable/disable, set priority cascade |
-| **File search** | Search inside `.nupkg` archives in the local package cache or download from a feed to search |
+| **File search** | Search inside `.nupkg` archives in the local package cache or download from a feed to search. Supports partial and exact matching. |
 | **Task automation** | Define multi-step tcpkg workflows with `{{token}}` placeholders for runtime values |
 | **Remote install status** | Installed-package index fetched from the selected target — shows correct up-to-date / upgradable / not-installed status per machine |
 
+---
 
+## Known limitations
+
+| Limitation | Detail |
+|---|---|
+| **No parallel batch execution** | tcpkg holds a system-wide lock for the full duration of every command. Running two tcpkg processes simultaneously on the same machine results in `TcPkg is already running`. All batch operations are sequential. |
+| **No authenticated remote feed add via ISE** | `tcpkg source add -r --password-stdin` is not supported by tcpkg for authenticated feeds. Adding an authenticated feed to a remote machine requires logging into that machine and running the command directly in PowerShell. Unauthenticated feeds can be added remotely without issue. |
+| **Interactive stdin not available in ISE** | The PowerShell ISE does not support interactive stdin for child processes. Commands that require interactive prompts (e.g. `tcpkg remote add -p`) are handled by collecting input via `Read-Host` and piping it to the process. |

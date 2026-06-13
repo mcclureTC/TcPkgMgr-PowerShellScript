@@ -45,6 +45,10 @@ $Script:LastRemoteInternetAccess = ''
 # Set by Confirm-RemoteFeeds option 1; cleared after restore.
 $Script:RemoteToRestore = ''
 
+# Feed credentials collected once in batch operations for reuse across targets.
+$Script:BatchFeedUser     = ''
+$Script:BatchFeedPlainPwd = ''
+
 # Beckhoff feed presets: name -> @{ Url; Priority }
 $Script:BeckhoffFeeds = [ordered]@{
     'Stable'   = @{ Url = 'https://public.tcpkg.beckhoff-cloud.com/api/v1/feeds/stable/';   Priority = 1 }
@@ -187,9 +191,9 @@ function Write-Command {
     Write-Host ("  > {0} {1}" -f $Script:TcpkgExe, ($ArgList -join ' ')) -ForegroundColor DarkGray
 }
 
-# Parse a selection string like "1,3,5..8,11" into a flat list of integers
-# within [1..$Max]. Individual numbers and N..M ranges are both supported.
-# Returns an array of valid 1-based indices (duplicates removed, sorted).
+# Parse a selection string like "1,3,5..8,11" or "1,3,5-8,11" into a flat
+# list of integers within [1..$Max]. Supports both .. and - as range separators,
+# individual numbers, and any combination. Returns sorted unique 1-based indices.
 function Expand-SelectionRange {
     param(
         [Parameter(Mandatory)] [string] $RawInput,
@@ -198,7 +202,8 @@ function Expand-SelectionRange {
     $indices = [System.Collections.Generic.SortedSet[int]]::new()
     foreach ($part in ($RawInput -split ',')) {
         $part = $part.Trim()
-        if ($part -match '^(\d+)\.\.(\d+)$') {
+        # Match N..M or N-M range patterns.
+        if ($part -match '^(\d+)\.\.(\d+)$' -or $part -match '^(\d+)-(\d+)$') {
             $from = [int]$Matches[1]; $to = [int]$Matches[2]
             if ($from -gt $to) { $from,$to = $to,$from }   # allow reverse ranges
             for ($i = $from; $i -le $to; $i++) {
@@ -951,7 +956,9 @@ function Confirm-RemoteFeeds {
         [Parameter(Mandatory)] [string]   $RequiredFeedName,
         [Parameter(Mandatory)] [string[]] $RemoteArgs,
         [Parameter(Mandatory)] [string]   $InternetAccess,
-        [switch]                           $AutoPushFromLocal
+        [switch]                           $AutoPushFromLocal,
+        [switch]                           $AutoAddFeed,
+        [switch]                           $AutoSkipMissing
     )
 
     if ($InternetAccess -ne 'True') {
@@ -990,38 +997,135 @@ function Confirm-RemoteFeeds {
     Write-Host ("  Feed '{0}' is not configured on {1}." -f $RequiredFeedName, $RemoteName) -ForegroundColor Yellow
 
     if ($AutoPushFromLocal) {
-        # Unattended: automatically switch to local-push without asking.
         Write-Host '  Auto-selecting: Push from local feeds.' -ForegroundColor Cyan
         $choice = '1'
+    } elseif ($AutoAddFeed) {
+        Write-Host '  Auto-selecting: Add feed remotely.' -ForegroundColor Cyan
+        $choice = '2'
+    } elseif ($AutoSkipMissing) {
+        Write-Host ("  Skipping '{0}' — feed not configured." -f $RemoteName) -ForegroundColor Yellow
+        return $false
     } else {
         Write-Host ''
         Write-Host '  How would you like to proceed?' -ForegroundColor Cyan
-        Write-Host '   1. Push from local  — use local feeds to download and push to the remote'
-        Write-Host '                         (works immediately, no changes needed on the remote)'
-        Write-Host '   2. Add feed first   — connect to the remote and add the feed, then retry'
+        Write-Host '   1. Push from local      — set Internet Access to False, install from local feeds'
+        Write-Host '   2. Add feed remotely    — add the feed to the remote via tcpkg source add -r'
+        Write-Host '                             (authenticated feeds: requires interactive login on remote)'
+        Write-Host '   3. Manual instructions  — show the command to run on the remote machine'
         Write-Host '   0. Cancel'
         Write-Host ''
         $choice = (Read-Host '  Choice').Trim()
     }
 
     if ($choice -eq '1') {
-            Write-Host ("  [Target: {0}] Setting Internet Access to False..." -f $RemoteName) -ForegroundColor Cyan
+        Write-Host ("  [Target: {0}] Setting Internet Access to False..." -f $RemoteName) -ForegroundColor Cyan
+        Invoke-Tcpkg -ArgList @('remote','edit',$RemoteName,'--internet-access','False','-y')
+        if ($Script:LastExit -ne 0) {
+            Write-Host '  Failed to update remote target. Aborting.' -ForegroundColor Red
+            return $false
+        }
+        Write-Host '  Internet Access set to False. Proceeding with local-push install.' -ForegroundColor Green
+        $Script:RemoteToRestore = $RemoteName
+        return $true
+
+    } elseif ($choice -eq '2') {
+        # Add the feed to the remote using ProcessStartInfo so we can pipe the
+        # password to stdin without the output pipeline interfering.
+        if (-not $localFeed) {
+            Write-Host ("  Cannot find '{0}' in local sources — URL unknown." -f $RequiredFeedName) -ForegroundColor Red
+            return $false
+        }
+        # Use pre-collected batch credentials if available, otherwise prompt.
+        if ($AutoAddFeed -and -not [string]::IsNullOrWhiteSpace($Script:BatchFeedUser)) {
+            $user     = $Script:BatchFeedUser
+            $plainPwd = $Script:BatchFeedPlainPwd
+        } else {
+            $user = Read-Value ("  Username for '{0}' feed (blank to skip credentials):" -f $RequiredFeedName) -AllowEmpty
+            $plainPwd = ''
+            if (-not [string]::IsNullOrWhiteSpace($user)) {
+                $securePwd = Read-Host '  Password' -AsSecureString
+                $plainPwd  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                                 [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd))
+            }
+        }
+
+        $addArgs = @('source','add',
+                     '-n', $RequiredFeedName,
+                     '-s', $feedUrl,
+                     '--priority','99',
+                     '-r', $RemoteName,
+                     '-y')
+        if (-not [string]::IsNullOrWhiteSpace($user)) {
+            $addArgs += @('-u', $user)
+            if ($plainPwd) { $addArgs += '--password-stdin' }
+        }
+
+        Write-Host ''
+        Write-Command -ArgList $addArgs
+
+        # Use ProcessStartInfo so stdin (password) is independent of stdout pipe.
+        $tcpkgExe = (Get-Command $Script:TcpkgExe -ErrorAction SilentlyContinue).Source
+        if (-not $tcpkgExe) { $tcpkgExe = $Script:TcpkgExe }
+        $argStr = ($addArgs | ForEach-Object {
+            if ($_ -match '\s') { "`"$_`"" } else { $_ }
+        }) -join ' '
+
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName               = $tcpkgExe
+        $psi.Arguments              = $argStr
+        $psi.UseShellExecute        = $false
+        $psi.RedirectStandardInput  = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError  = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
+
+        $proc    = [System.Diagnostics.Process]::Start($psi)
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+
+        if ($plainPwd) {
+            $proc.StandardInput.WriteLine($plainPwd)
+        }
+        $proc.StandardInput.Close()
+        $proc.WaitForExit()
+
+        $stdout = $outTask.Result; $stderr = $errTask.Result
+        foreach ($line in (($stdout + "`n" + $stderr) -split "`n")) {
+            $line = $line.TrimEnd("`r")
+            if ([string]::IsNullOrWhiteSpace($line) -or $line -match '^TcPkg \d') { continue }
+            Write-Host $line
+        }
+
+        if ($proc.ExitCode -eq 0) {
+            Write-Host ("  Feed '{0}' added to {1} successfully." -f $RequiredFeedName, $RemoteName) -ForegroundColor Green
+            return $true
+        } else {
+            Write-Host ("  Failed to add feed (exit {0})." -f $proc.ExitCode) -ForegroundColor Red
+            # tcpkg does not support --password-stdin for source add -r.
+            # Automatically fall back to push-from-local.
+            Write-Host '  tcpkg does not support non-interactive authenticated feed add on remote targets.' -ForegroundColor Yellow
+            Write-Host '  Falling back to push-from-local for this target.' -ForegroundColor Yellow
             Invoke-Tcpkg -ArgList @('remote','edit',$RemoteName,'--internet-access','False','-y')
-            if ($Script:LastExit -ne 0) {
-                Write-Host '  Failed to update remote target. Aborting.' -ForegroundColor Red
+            if ($Script:LastExit -eq 0) {
+                Write-Host '  Internet Access set to False. Proceeding with local-push install.' -ForegroundColor Green
+                $Script:RemoteToRestore = $RemoteName
+                return $true
+            } else {
+                Write-Host '  Failed to switch to local-push. Aborting.' -ForegroundColor Red
                 return $false
             }
-            Write-Host '  Internet Access set to False. Proceeding with local-push install.' -ForegroundColor Green
-            $Script:RemoteToRestore = $RemoteName
-            return $true
-    } elseif ($choice -eq '2') {
-            Write-Host ''
-            Write-Host '  Connect to the remote machine, open PowerShell, and run:' -ForegroundColor Cyan
-            Write-Host ("    tcpkg source add -n `"$RequiredFeedName`" -s `"$feedUrl`" --priority 99 -u <username> -p <password> -y") -ForegroundColor White
-            Write-Host '  Note: replace <username> and <password> with your myBeckhoff credentials. Run in PowerShell, not cmd.exe.' -ForegroundColor DarkGray
-            Write-Host ''
-            Write-Host '  After adding the feed, retry the install from this menu.' -ForegroundColor DarkGray
-            return (Confirm-YesNo -Prompt 'Proceed with install now anyway?')
+        }
+
+    } elseif ($choice -eq '3') {
+        Write-Host ''
+        Write-Host '  Connect to the remote machine, open PowerShell, and run:' -ForegroundColor Cyan
+        Write-Host ("    tcpkg source add -n `"$RequiredFeedName`" -s `"$feedUrl`" --priority 99 -u <username> -p <password> -y") -ForegroundColor White
+        Write-Host '  Note: replace <username> and <password> with your myBeckhoff credentials. Run in PowerShell, not cmd.exe.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '  After adding the feed, retry the install from this menu.' -ForegroundColor DarkGray
+        return (Confirm-YesNo -Prompt 'Proceed with install now anyway?')
+
     } else {
         return $false
     }
@@ -1320,7 +1424,7 @@ function Invoke-BatchOperation {
         Write-Host '  No remote targets are configured.' -ForegroundColor Yellow
         Wait-Continue; return
     }
-    Write-Host '  Select target machines (e.g. 1,3,5..8 — numbers and ranges, blank to cancel):' -ForegroundColor Cyan
+    Write-Host '  Select target machines (e.g. 1,3,5..8 or 1,3,5-8 — numbers and ranges, blank to cancel):' -ForegroundColor Cyan
     Show-SelectableList -Items $remotes -Columns @(
         @{ Header = 'Name';            Expr = { $_.Name } },
         @{ Header = 'Host';            Expr = { $_.Host } },
@@ -1336,14 +1440,23 @@ function Invoke-BatchOperation {
     }
     if ($targets.Count -eq 0) { Write-Host '  No valid targets selected.' -ForegroundColor Yellow; return }
 
-    # Step 4: confirm and run.
+    # Step 4: confirm and choose execution mode.
     Write-Host ''
     Write-Host '  Summary:' -ForegroundColor Cyan
     Write-Host ("   Action  : {0}" -f $action.ToUpper())
     Write-Host ("   Package : {0}" -f $packageSpec)
     Write-Host ("   Targets : {0}" -f (($targets | ForEach-Object { $_.Name }) -join ', '))
     Write-Host ''
-    if (-not (Confirm-YesNo -Prompt 'Proceed?')) { return }
+    Write-Host '  Execution mode:' -ForegroundColor Cyan
+    Write-Host '   1. Sequential — one target at a time (only supported mode)'
+    Write-Host '      Note: tcpkg holds a system-wide lock for the full duration'
+    Write-Host '      of each command. Parallel execution from one machine is not'
+    Write-Host '      possible regardless of Internet Access or feed configuration.'
+    Write-Host '   0. Cancel'
+    Write-Host ''
+    $modeChoice = (Read-Host '  Choice').Trim()
+    if ($modeChoice -eq '0' -or [string]::IsNullOrWhiteSpace($modeChoice)) { return }
+    $parallel = $false   # always sequential
 
     if ($Script:ReadOnly) {
         Write-Host ''
@@ -1351,51 +1464,127 @@ function Invoke-BatchOperation {
         Write-Host '  Select option 8 from the main menu to turn read-only mode off.' -ForegroundColor Yellow
     }
 
-    Write-Host ''
-    $results = @()
-    foreach ($target in $targets) {
-        $num = $results.Count + 1
-        Write-Host ('  ── [{0}/{1}] {2} on {3} ──' -f $num, $targets.Count, $action.ToUpper(), $target.Name) -ForegroundColor Cyan
+    # For installs, ask once how to handle missing feeds on remote targets.
+    $batchFeedStrategy   = 'push'   # default
+    $batchFeedUser       = ''
+    $batchFeedPlainPwd   = ''
+    if ($action -eq 'install' -and -not [string]::IsNullOrWhiteSpace($batchFeedName)) {
+        Write-Host ''
+        Write-Host '  If a required feed is not configured on a remote target:' -ForegroundColor Cyan
+        Write-Host '   1. Push from local  — set Internet Access to False, push via local feeds'
+        Write-Host '   2. Add feed         — add the feed via tcpkg source add -r'
+        Write-Host '                         (unauthenticated feeds only; authenticated feeds'
+        Write-Host '                          will fall back to push-from-local automatically)'
+        Write-Host '   3. Skip target      — skip targets that are missing the feed'
+        Write-Host ''
+        $fsChoice = (Read-Host '  Feed strategy (blank = Push from local)').Trim()
+        if     ($fsChoice -eq '2') { $batchFeedStrategy = 'add' }
+        elseif ($fsChoice -eq '3') { $batchFeedStrategy = 'skip' }
+        else                        { $batchFeedStrategy = 'push' }
 
-        # For installs on targets with Internet Access = True, check the feed
-        # is configured on the remote. In batch mode, auto-push from local.
-        $proceed = $true
+        if ($batchFeedStrategy -eq 'add') {
+            Write-Host ''
+            Write-Host ("  Credentials for the '{0}' feed (collected once for all targets):" -f $batchFeedName) -ForegroundColor Cyan
+            $batchFeedUser = Read-Value '  Username (blank = no credentials):' -AllowEmpty
+            if (-not [string]::IsNullOrWhiteSpace($batchFeedUser)) {
+                $securePwd       = Read-Host '  Password' -AsSecureString
+                $batchFeedPlainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                                         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd))
+            }
+            # Store for use in Confirm-RemoteFeeds via script-scope variables.
+            $Script:BatchFeedUser     = $batchFeedUser
+            $Script:BatchFeedPlainPwd = $batchFeedPlainPwd
+        }
+    }
+
+    # Pre-process all targets: handle feed checks and internet-access toggles
+    # before launching any processes, since those steps are interactive.
+    Write-Host ''
+    $plan = @()
+    foreach ($target in $targets) {
+        $proceed   = $true
+        $argList   = @($action, $packageSpec, '-r', $target.Name, '-y')
+        $restoreIA = $false
+
         if ($action -eq 'install' -and $target.InternetAccess -eq 'True') {
             if (-not [string]::IsNullOrWhiteSpace($batchFeedName)) {
-                $proceed = Confirm-RemoteFeeds `
-                    -RemoteName       $target.Name `
-                    -RequiredFeedName $batchFeedName `
-                    -RemoteArgs       @('-r', $target.Name) `
-                    -InternetAccess   $target.InternetAccess `
-                    -AutoPushFromLocal
+                if ($batchFeedStrategy -eq 'push') {
+                    $proceed = Confirm-RemoteFeeds `
+                        -RemoteName       $target.Name `
+                        -RequiredFeedName $batchFeedName `
+                        -RemoteArgs       @('-r', $target.Name) `
+                        -InternetAccess   $target.InternetAccess `
+                        -AutoPushFromLocal
+                } elseif ($batchFeedStrategy -eq 'add') {
+                    $proceed = Confirm-RemoteFeeds `
+                        -RemoteName       $target.Name `
+                        -RequiredFeedName $batchFeedName `
+                        -RemoteArgs       @('-r', $target.Name) `
+                        -InternetAccess   $target.InternetAccess `
+                        -AutoAddFeed
+                } else {
+                    # 'skip' — check if feed is present; skip target if not.
+                    $proceed = Confirm-RemoteFeeds `
+                        -RemoteName       $target.Name `
+                        -RequiredFeedName $batchFeedName `
+                        -RemoteArgs       @('-r', $target.Name) `
+                        -InternetAccess   $target.InternetAccess `
+                        -AutoSkipMissing
+                }
+                if ($Script:RemoteToRestore -eq $target.Name) {
+                    $restoreIA = $true
+                    $Script:RemoteToRestore = ''
+                }
             }
         }
+
+        $plan += [pscustomobject]@{
+            Target    = $target
+            ArgList   = $argList
+            Proceed   = $proceed
+            RestoreIA = $restoreIA
+        }
+    }
+
+    $results = @()
+
+    if ($parallel) {
+        # tcpkg holds a system-wide lock for the entire duration of every command,
+        # including the compatibility check phase that runs before any download.
+        # This means no two tcpkg processes can run simultaneously on this machine
+        # regardless of Internet Access setting or feed configuration.
+        # Parallel mode is therefore not supported — always use sequential.
+        Write-Host ''
+        Write-Host '  Note: tcpkg holds a system-wide lock for the full duration of each' -ForegroundColor Yellow
+        Write-Host '  command. Parallel execution is not possible from one machine.' -ForegroundColor Yellow
+        Write-Host '  Switching to sequential mode.' -ForegroundColor Yellow
+        $parallel = $false
+    }
+
+    # ── Sequential mode ────────────────────────────────────────────────────
+    foreach ($item in $plan) {
+        $num   = $results.Count + 1
+        $tName = $item.Target.Name
+        Write-Host ('  ── [{0}/{1}] {2} on {3} ──' -f $num, $plan.Count, $action.ToUpper(), $tName) -ForegroundColor Cyan
 
         $exitCode = 0
-        if ($proceed) {
-            $argList = @($action, $packageSpec, '-r', $target.Name, '-y')
-            Invoke-Tcpkg -ArgList $argList
+        if ($item.Proceed) {
+            Invoke-Tcpkg -ArgList $item.ArgList
             $exitCode = $Script:LastExit
 
-            # Restore internet access if Confirm-RemoteFeeds temporarily changed it.
-            if ($Script:RemoteToRestore -eq $target.Name) {
-                Write-Host ("  [Target: {0}] Restoring Internet Access to True..." -f $target.Name) -ForegroundColor Cyan
-                Invoke-Tcpkg -ArgList @('remote','edit',$target.Name,'--internet-access','True','-y')
-                $Script:RemoteToRestore = ''
+            if ($item.RestoreIA) {
+                Write-Host ("  [Target: {0}] Restoring Internet Access to True..." -f $tName) -ForegroundColor Cyan
+                Invoke-Tcpkg -ArgList @('remote','edit',$tName,'--internet-access','True','-y')
             }
         } else {
-            $exitCode = -1   # skipped by user
+            $exitCode = -1
         }
 
-        $status = if (-not $proceed) { 'Skipped' } elseif ($exitCode -eq 0) { 'OK' } else { "Failed ($exitCode)" }
-        $results += [pscustomobject]@{
-            Target  = $target.Name
-            Package = $packageSpec
-            Status  = $status
-        }
-        $color = if ($status -eq 'OK') { 'Green' } elseif ($status -eq 'Skipped') { 'Yellow' } else { 'Red' }
+        $status = if (-not $item.Proceed) { 'Skipped' } elseif ($exitCode -eq 0) { 'OK' } else { "Failed ($exitCode)" }
+        $color  = if ($status -eq 'OK') { 'Green' } elseif ($status -eq 'Skipped') { 'Yellow' } else { 'Red' }
         Write-Host ("  Result: {0}" -f $status) -ForegroundColor $color
         Write-Host ''
+        $results += [pscustomobject]@{ Target = $tName; Package = $packageSpec; Status = $status }
     }
 
     # Summary table.
@@ -2813,7 +3002,7 @@ function Invoke-FeedFileSearch {
     Write-Host '  Which packages do you want to search inside?' -ForegroundColor Cyan
     Show-SelectableList -Items $res.Items -Columns $res.Columns
     Write-Host ''
-    Write-Host '  Enter numbers or ranges (e.g. 1,3,5..8), or blank to cancel' -ForegroundColor DarkGray
+    Write-Host '  Enter numbers or ranges (e.g. 1,3,5..8 or 1,3,5-8), or blank to cancel' -ForegroundColor DarkGray
     $raw = (Read-Host '  Choice').Trim()
     if ([string]::IsNullOrWhiteSpace($raw)) { return }
 
