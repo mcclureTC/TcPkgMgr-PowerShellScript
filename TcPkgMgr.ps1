@@ -8,7 +8,7 @@
              (packages/workloads, sources/feeds, configuration).
     Part 2 - a lightweight task runner that lets you save and replay a
              named *sequence* of tcpkg commands as a "task", with optional
-             {{token}} prompts and a global dry-run mode.
+             {{token}} prompts and a global read-only mode.
 
     Tasks are stored as JSON next to this script (tcpkg-tasks.json), so you
     can hand-edit, version-control, or share them.
@@ -32,7 +32,7 @@ $baseDir = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $Script:TasksFile = Join-Path $baseDir 'tcpkg-tasks.json'
 
 # When $true, commands are printed but never executed.
-$Script:DryRun = $true
+$Script:ReadOnly = $true
 
 # Exit code of the most recent tcpkg invocation (set by Invoke-Tcpkg).
 $Script:LastExit = 0
@@ -75,7 +75,7 @@ function Split-CommandLine {
     }
 }
 
-# Run tcpkg with an argument array. Honours dry-run.
+# Run tcpkg with an argument array. Honours read-only.
 # Shows a live elapsed-time indicator on the same line during silent periods
 # so the user knows the command is still running.
 function Invoke-Tcpkg {
@@ -85,15 +85,15 @@ function Invoke-Tcpkg {
     )
     $display = "$Script:TcpkgExe $($ArgList -join ' ')"
 
-    if ($Script:DryRun) {
-        Write-Host "  [dry-run] $display" -ForegroundColor DarkYellow
+    if ($Script:ReadOnly) {
+        Write-Host "  [read-only] $display" -ForegroundColor DarkYellow
         $Script:LastExit = 0
         return
     }
 
     if (-not (Test-TcpkgAvailable)) {
         Write-Host "  tcpkg was not found on PATH. Install the TwinCAT Package Manager," -ForegroundColor Red
-        Write-Host "  or enable dry-run mode from the main menu to preview commands." -ForegroundColor Red
+        Write-Host "  or enable read-only mode from the main menu to preview commands." -ForegroundColor Red
         $Script:LastExit = 1
         return
     }
@@ -187,6 +187,31 @@ function Write-Command {
     Write-Host ("  > {0} {1}" -f $Script:TcpkgExe, ($ArgList -join ' ')) -ForegroundColor DarkGray
 }
 
+# Parse a selection string like "1,3,5..8,11" into a flat list of integers
+# within [1..$Max]. Individual numbers and N..M ranges are both supported.
+# Returns an array of valid 1-based indices (duplicates removed, sorted).
+function Expand-SelectionRange {
+    param(
+        [Parameter(Mandatory)] [string] $RawInput,
+        [Parameter(Mandatory)] [int]    $Max
+    )
+    $indices = [System.Collections.Generic.SortedSet[int]]::new()
+    foreach ($part in ($RawInput -split ',')) {
+        $part = $part.Trim()
+        if ($part -match '^(\d+)\.\.(\d+)$') {
+            $from = [int]$Matches[1]; $to = [int]$Matches[2]
+            if ($from -gt $to) { $from,$to = $to,$from }   # allow reverse ranges
+            for ($i = $from; $i -le $to; $i++) {
+                if ($i -ge 1 -and $i -le $Max) { [void]$indices.Add($i) }
+            }
+        } elseif ($part -match '^\d+$') {
+            $n = [int]$part
+            if ($n -ge 1 -and $n -le $Max) { [void]$indices.Add($n) }
+        }
+    }
+    return @($indices)
+}
+
 function Read-Value {
     param([string]$Prompt, [switch]$AllowEmpty, [switch]$CancelOnBlank)
     while ($true) {
@@ -220,8 +245,8 @@ function Show-Header {
     Clear-Host
     Write-Host '==============================================================' -ForegroundColor Cyan
     Write-Host "  TwinCAT Package Manager Console   |   $Title" -ForegroundColor Cyan
-    $mode      = if ($Script:DryRun) { 'DRY-RUN (no changes made)' } else { 'LIVE' }
-    $modeColor = if ($Script:DryRun) { 'Yellow' } else { 'Green' }
+    $mode      = if ($Script:ReadOnly) { 'READ-ONLY (no changes made)' } else { 'LIVE' }
+    $modeColor = if ($Script:ReadOnly) { 'Yellow' } else { 'Green' }
     Write-Host -NoNewline '  Mode: '
     Write-Host $mode -ForegroundColor $modeColor
     Write-Host '==============================================================' -ForegroundColor Cyan
@@ -556,8 +581,8 @@ function Invoke-TasksMenu {
 # render correctly regardless of the console's default output encoding.
 function Invoke-DependencyTree {
     param([Parameter(Mandatory)] [string] $PackageName)
-    if ($Script:DryRun) {
-        Write-Host ("  [dry-run] {0} resolve {1} --dependency-tree" -f $Script:TcpkgExe, $PackageName) -ForegroundColor DarkYellow
+    if ($Script:ReadOnly) {
+        Write-Host ("  [read-only] {0} resolve {1} --dependency-tree" -f $Script:TcpkgExe, $PackageName) -ForegroundColor DarkYellow
         return
     }
     if (-not (Test-TcpkgAvailable)) {
@@ -777,12 +802,11 @@ function Select-PackageAction {
     )
     $target = if ($RemoteArgs.Count -ge 2) { "  Target : $($RemoteArgs[1])" } else { "  Target : local" }    $status    = Get-InstallStatus -Name $Name -InstalledIndex $InstalledIndex -FeedVersion $FeedVersion
     $instVer   = $InstalledIndex[$Name.ToLower()]
-    $statusMsg = switch ($status) {
-        'not-installed'    { 'not installed' }
-        'up-to-date'       { "installed  v$instVer  (up to date)" }
-        'upgradable'       { "installed  v$instVer  -> v$FeedVersion available" }
-        'newer-than-feed'  { "installed  v$instVer  (feed has v$FeedVersion)" }
-    }
+    if     ($status -eq 'not-installed')   { $statusMsg = 'not installed' }
+    elseif ($status -eq 'up-to-date')      { $statusMsg = "installed  v$instVer  (up to date)" }
+    elseif ($status -eq 'upgradable')      { $statusMsg = "installed  v$instVer  -> v$FeedVersion available" }
+    elseif ($status -eq 'newer-than-feed') { $statusMsg = "installed  v$instVer  (feed has v$FeedVersion)" }
+    else                                   { $statusMsg = $status }
 
     # Build the dynamic action list with its tcpkg command label.
     $actions = [System.Collections.Generic.List[pscustomobject]]::new()
@@ -926,7 +950,8 @@ function Confirm-RemoteFeeds {
         [Parameter(Mandatory)] [string]   $RemoteName,
         [Parameter(Mandatory)] [string]   $RequiredFeedName,
         [Parameter(Mandatory)] [string[]] $RemoteArgs,
-        [Parameter(Mandatory)] [string]   $InternetAccess
+        [Parameter(Mandatory)] [string]   $InternetAccess,
+        [switch]                           $AutoPushFromLocal
     )
 
     if ($InternetAccess -ne 'True') {
@@ -958,20 +983,28 @@ function Confirm-RemoteFeeds {
         return $true
     }
 
-    # Feed is missing on the remote — offer two options.
+    # Feed is missing on the remote — offer two options, or auto-push if requested.
     $localFeed = Get-SourceList | Where-Object { $_.Name -eq $RequiredFeedName } | Select-Object -First 1
     $feedUrl   = if ($localFeed) { $localFeed.Url } else { '<feed-url>' }
 
     Write-Host ("  Feed '{0}' is not configured on {1}." -f $RequiredFeedName, $RemoteName) -ForegroundColor Yellow
-    Write-Host ''
-    Write-Host '  How would you like to proceed?' -ForegroundColor Cyan
-    Write-Host '   1. Push from local  — use local feeds to download and push to the remote'
-    Write-Host '                         (works immediately, no changes needed on the remote)'
-    Write-Host '   2. Add feed first   — connect to the remote and add the feed, then retry'
-    Write-Host '   0. Cancel'
-    Write-Host ''
-    switch ((Read-Host '  Choice').Trim()) {
-        '1' {
+
+    if ($AutoPushFromLocal) {
+        # Unattended: automatically switch to local-push without asking.
+        Write-Host '  Auto-selecting: Push from local feeds.' -ForegroundColor Cyan
+        $choice = '1'
+    } else {
+        Write-Host ''
+        Write-Host '  How would you like to proceed?' -ForegroundColor Cyan
+        Write-Host '   1. Push from local  — use local feeds to download and push to the remote'
+        Write-Host '                         (works immediately, no changes needed on the remote)'
+        Write-Host '   2. Add feed first   — connect to the remote and add the feed, then retry'
+        Write-Host '   0. Cancel'
+        Write-Host ''
+        $choice = (Read-Host '  Choice').Trim()
+    }
+
+    if ($choice -eq '1') {
             Write-Host ("  [Target: {0}] Setting Internet Access to False..." -f $RemoteName) -ForegroundColor Cyan
             Invoke-Tcpkg -ArgList @('remote','edit',$RemoteName,'--internet-access','False','-y')
             if ($Script:LastExit -ne 0) {
@@ -981,8 +1014,7 @@ function Confirm-RemoteFeeds {
             Write-Host '  Internet Access set to False. Proceeding with local-push install.' -ForegroundColor Green
             $Script:RemoteToRestore = $RemoteName
             return $true
-        }
-        '2' {
+    } elseif ($choice -eq '2') {
             Write-Host ''
             Write-Host '  Connect to the remote machine, open PowerShell, and run:' -ForegroundColor Cyan
             Write-Host ("    tcpkg source add -n `"$RequiredFeedName`" -s `"$feedUrl`" --priority 99 -u <username> -p <password> -y") -ForegroundColor White
@@ -990,8 +1022,8 @@ function Confirm-RemoteFeeds {
             Write-Host ''
             Write-Host '  After adding the feed, retry the install from this menu.' -ForegroundColor DarkGray
             return (Confirm-YesNo -Prompt 'Proceed with install now anyway?')
-        }
-        default { return $false }
+    } else {
+        return $false
     }
 }
 
@@ -1108,6 +1140,274 @@ function Invoke-PackageAction {
     }
 }
 
+
+# ============================================================================
+#  Batch operations — run install / upgrade / uninstall on multiple targets
+# ============================================================================
+
+function Invoke-BatchOperation {
+    param([string] $PresetAction = '')   # 'install', 'upgrade', or 'uninstall'
+    Show-Header -Title 'Batch operation'
+
+    # Step 1: choose action (skip if pre-set by caller).
+    $action = $PresetAction.ToLower()
+    if ($action -notin @('install','upgrade','uninstall')) {
+        Write-Host '  Action to perform on all selected targets:' -ForegroundColor Cyan
+        Write-Host '   1. Install   — tcpkg install <package> -r <target> -y'
+        Write-Host '   2. Upgrade   — tcpkg upgrade <package> -r <target> -y'
+        Write-Host '   3. Uninstall — tcpkg uninstall <package> -r <target> -y'
+        Write-Host '   0. Cancel'
+        Write-Host ''
+        $actionChoice = (Read-Host '  Choice').Trim()
+        if ($actionChoice -eq '0' -or [string]::IsNullOrWhiteSpace($actionChoice)) { return }
+        if ($actionChoice -notin @('1','2','3')) { Write-Host '  Invalid choice.' -ForegroundColor Yellow; return }
+        if     ($actionChoice -eq '1') { $action = 'install'   }
+        elseif ($actionChoice -eq '2') { $action = 'upgrade'   }
+        elseif ($actionChoice -eq '3') { $action = 'uninstall' }
+    } else {
+        Write-Host ("  Action: {0}" -f $action.ToUpper()) -ForegroundColor Cyan
+    }
+
+    # Step 2: choose the package.
+    Write-Host ''
+    if ($action -eq 'install') {
+        # Search feed for the package.
+        $term = Read-Value 'Package name search term (blank to cancel):' -CancelOnBlank
+        if ($null -eq $term) { return }
+            $filter = Select-FeedFilter
+            if ($null -eq $filter) { return }
+        Write-Host ''
+        $res = Get-PackageList -ListArgs (@('list', $term) + $filter)
+            if (-not $res.Ok -or @($res.Items).Count -eq 0) {
+            Write-Host "  No packages found matching '$term'." -ForegroundColor Yellow
+            Wait-Continue; return
+        }
+        Write-Host ''
+        Write-Host '  Select the package to install:' -ForegroundColor Cyan
+        Show-SelectableList -Items $res.Items -Columns $res.Columns
+        $pkgSel = Read-Host "`n  Package number (blank to cancel)"
+        if ([string]::IsNullOrWhiteSpace($pkgSel)) { return }
+        if ($pkgSel -notmatch '^\d+$' -or [int]$pkgSel -lt 1 -or [int]$pkgSel -gt @($res.Items).Count) {
+            Write-Host '  Invalid selection.' -ForegroundColor Yellow; return
+        }
+        $pkg = $res.Items[[int]$pkgSel - 1]
+    
+        # Pick version.
+        Write-Host ''
+        Write-Host '  Fetching available versions...' -ForegroundColor DarkGray
+        $prev = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
+        Write-Command -ArgList @('list','-a',$pkg.Name,'--as-json')
+        $rawV = & $Script:TcpkgExe list '-a' $pkg.Name '--as-json' 2>&1
+        $ErrorActionPreference = $prev
+        $textV = (@($rawV) | ForEach-Object { [string]$_ }) -join "`n"
+        $si = $textV.IndexOf('['); $ei = $textV.LastIndexOf(']')
+        $verItems = @()
+        if ($si -ge 0 -and $ei -gt $si) {
+            try {
+                $json = $textV.Substring($si, $ei - $si + 1) | ConvertFrom-Json
+                $seen = @{}
+                foreach ($j in @($json | Where-Object { $null -ne $_.Version })) {
+                    $v = [string]$j.Version
+                    if (-not $seen.ContainsKey($v)) { $seen[$v] = if ($j.Source) { [string]$j.Source } else { '' } }
+                }
+                $verItems = @($seen.GetEnumerator() | ForEach-Object { [pscustomobject]@{ Version = $_.Key; Source = $_.Value } })
+            } catch {}
+        }
+        if ($verItems.Count -gt 0) {
+            try   { $sortedV = @($verItems | Sort-Object { [System.Version]$_.Version } -Descending) }
+            catch { $sortedV = @($verItems | Sort-Object { $_.Version } -Descending) }
+            Write-Host ''
+            Write-Host ("  Available versions of $($pkg.Name) :") -ForegroundColor Cyan
+            Show-SelectableList -Items $sortedV -Columns @(
+                @{ Header = 'Version'; Expr = { $_.Version } },
+                @{ Header = 'Feed';    Expr = { $_.Source } }
+            )
+            Write-Host ("   {0}. Latest (let tcpkg decide)" -f ($sortedV.Count + 1))
+            Write-Host '   0. Cancel'
+            Write-Host ''
+            $vs = (Read-Host '  Choice').Trim()
+            if ($vs -eq '0' -or [string]::IsNullOrWhiteSpace($vs)) { return }
+            if ($vs -match '^\d+$' -and [int]$vs -ge 1 -and [int]$vs -le $sortedV.Count) {
+                $packageSpec  = "$($pkg.Name.ToLower())=$($sortedV[[int]$vs - 1].Version)"
+                $batchFeedName = $sortedV[[int]$vs - 1].Source
+            } elseif ($vs -eq [string]($sortedV.Count + 1)) {
+                $packageSpec  = $pkg.Name.ToLower()
+                $batchFeedName = ''
+            } else { Write-Host '  Invalid selection.' -ForegroundColor Yellow; return }
+        } else {
+            Write-Host '  Could not retrieve versions; using latest.' -ForegroundColor Yellow
+            $packageSpec   = $pkg.Name.ToLower()
+            $batchFeedName = ''
+        }
+    } else {
+        $batchFeedName = ''
+        if ($action -eq 'uninstall') {
+            # Search installed packages on a representative remote target.
+            Write-Host '  Select a remote target to check installed packages on:' -ForegroundColor Cyan
+            $remoteList = @(Get-RemoteList)
+            if ($remoteList.Count -gt 0) {
+                Show-SelectableList -Items $remoteList -Columns @(
+                    @{ Header = 'Name'; Expr = { $_.Name } },
+                    @{ Header = 'Host'; Expr = { $_.Host } }
+                )
+                $rSel = Read-Host "`n  Target number (blank = search local)"
+                if ($rSel -match '^\d+$' -and [int]$rSel -ge 1 -and [int]$rSel -le $remoteList.Count) {
+                    $searchRemoteArgs = @('-r', $remoteList[[int]$rSel - 1].Name)
+                    Write-Host ("  Searching installed packages on '{0}'..." -f $remoteList[[int]$rSel - 1].Name) -ForegroundColor DarkGray
+                } else {
+                    $searchRemoteArgs = @()
+                    Write-Host '  Searching locally installed packages...' -ForegroundColor DarkGray
+                }
+            } else {
+                $searchRemoteArgs = @()
+                Write-Host '  No remotes configured; searching locally installed packages...' -ForegroundColor DarkGray
+            }
+
+            $term = Read-Value 'Search term (blank = list all installed):' -AllowEmpty
+            $listArgs = if ([string]::IsNullOrWhiteSpace($term)) {
+                @('list','-i') + $searchRemoteArgs
+            } else {
+                @('list', $term, '-i') + $searchRemoteArgs
+            }
+            $res = Get-PackageList -ListArgs $listArgs
+            if ($res.Ok -and @($res.Items).Count -gt 0) {
+                Write-Host ''
+                Write-Host '  Select the package to uninstall:' -ForegroundColor Cyan
+                Show-SelectableList -Items $res.Items -Columns $res.Columns
+                $pkgSel = Read-Host "`n  Package number (blank to cancel)"
+                if ([string]::IsNullOrWhiteSpace($pkgSel)) { return }
+                if ($pkgSel -notmatch '^\d+$' -or [int]$pkgSel -lt 1 -or [int]$pkgSel -gt @($res.Items).Count) {
+                    Write-Host '  Invalid selection.' -ForegroundColor Yellow; return
+                }
+                $packageSpec = $res.Items[[int]$pkgSel - 1].Name.ToLower()
+            } else {
+                Write-Host '  No installed packages found; enter the name manually.' -ForegroundColor Yellow
+                $packageSpec = Read-Value 'Package name (blank to cancel):' -CancelOnBlank
+                if ($null -eq $packageSpec) { return }
+                $packageSpec = $packageSpec.ToLower()
+            }
+        } elseif ($action -eq 'upgrade') {
+            # Search feed for the package to upgrade.
+            $term = Read-Value 'Package name search term (blank to cancel):' -CancelOnBlank
+            if ($null -eq $term) { return }
+            $filter = Select-FeedFilter
+            if ($null -eq $filter) { return }
+            Write-Host ''
+            $res = Get-PackageList -ListArgs (@('list', $term) + $filter)
+            if ($res.Ok -and @($res.Items).Count -gt 0) {
+                Write-Host ''
+                Write-Host '  Select the package to upgrade:' -ForegroundColor Cyan
+                Show-SelectableList -Items $res.Items -Columns $res.Columns
+                $pkgSel = Read-Host "`n  Package number (blank to cancel)"
+                if ([string]::IsNullOrWhiteSpace($pkgSel)) { return }
+                if ($pkgSel -notmatch '^\d+$' -or [int]$pkgSel -lt 1 -or [int]$pkgSel -gt @($res.Items).Count) {
+                    Write-Host '  Invalid selection.' -ForegroundColor Yellow; return
+                }
+                $packageSpec = $res.Items[[int]$pkgSel - 1].Name.ToLower()
+            } else {
+                Write-Host '  No packages found; enter the name manually.' -ForegroundColor Yellow
+                $packageSpec = Read-Value 'Package name (blank to cancel):' -CancelOnBlank
+                if ($null -eq $packageSpec) { return }
+                $packageSpec = $packageSpec.ToLower()
+            }
+        }
+    }
+
+    # Step 3: select target machines (multi-select).
+    Write-Host ''
+    $remotes = @(Get-RemoteList)
+    if ($remotes.Count -eq 0) {
+        Write-Host '  No remote targets are configured.' -ForegroundColor Yellow
+        Wait-Continue; return
+    }
+    Write-Host '  Select target machines (e.g. 1,3,5..8 — numbers and ranges, blank to cancel):' -ForegroundColor Cyan
+    Show-SelectableList -Items $remotes -Columns @(
+        @{ Header = 'Name';            Expr = { $_.Name } },
+        @{ Header = 'Host';            Expr = { $_.Host } },
+        @{ Header = 'Internet Access'; Expr = { $_.InternetAccess } }
+    )
+    Write-Host ''
+    $raw = (Read-Host '  Targets').Trim()
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+
+    $targets = @()
+    foreach ($idx in (Expand-SelectionRange -RawInput $raw -Max $remotes.Count)) {
+        $targets += $remotes[$idx - 1]
+    }
+    if ($targets.Count -eq 0) { Write-Host '  No valid targets selected.' -ForegroundColor Yellow; return }
+
+    # Step 4: confirm and run.
+    Write-Host ''
+    Write-Host '  Summary:' -ForegroundColor Cyan
+    Write-Host ("   Action  : {0}" -f $action.ToUpper())
+    Write-Host ("   Package : {0}" -f $packageSpec)
+    Write-Host ("   Targets : {0}" -f (($targets | ForEach-Object { $_.Name }) -join ', '))
+    Write-Host ''
+    if (-not (Confirm-YesNo -Prompt 'Proceed?')) { return }
+
+    if ($Script:ReadOnly) {
+        Write-Host ''
+        Write-Host '  READ-ONLY MODE IS ON — commands will be shown but not executed.' -ForegroundColor Yellow
+        Write-Host '  Select option 8 from the main menu to turn read-only mode off.' -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    $results = @()
+    foreach ($target in $targets) {
+        $num = $results.Count + 1
+        Write-Host ('  ── [{0}/{1}] {2} on {3} ──' -f $num, $targets.Count, $action.ToUpper(), $target.Name) -ForegroundColor Cyan
+
+        # For installs on targets with Internet Access = True, check the feed
+        # is configured on the remote. In batch mode, auto-push from local.
+        $proceed = $true
+        if ($action -eq 'install' -and $target.InternetAccess -eq 'True') {
+            if (-not [string]::IsNullOrWhiteSpace($batchFeedName)) {
+                $proceed = Confirm-RemoteFeeds `
+                    -RemoteName       $target.Name `
+                    -RequiredFeedName $batchFeedName `
+                    -RemoteArgs       @('-r', $target.Name) `
+                    -InternetAccess   $target.InternetAccess `
+                    -AutoPushFromLocal
+            }
+        }
+
+        $exitCode = 0
+        if ($proceed) {
+            $argList = @($action, $packageSpec, '-r', $target.Name, '-y')
+            Invoke-Tcpkg -ArgList $argList
+            $exitCode = $Script:LastExit
+
+            # Restore internet access if Confirm-RemoteFeeds temporarily changed it.
+            if ($Script:RemoteToRestore -eq $target.Name) {
+                Write-Host ("  [Target: {0}] Restoring Internet Access to True..." -f $target.Name) -ForegroundColor Cyan
+                Invoke-Tcpkg -ArgList @('remote','edit',$target.Name,'--internet-access','True','-y')
+                $Script:RemoteToRestore = ''
+            }
+        } else {
+            $exitCode = -1   # skipped by user
+        }
+
+        $status = if (-not $proceed) { 'Skipped' } elseif ($exitCode -eq 0) { 'OK' } else { "Failed ($exitCode)" }
+        $results += [pscustomobject]@{
+            Target  = $target.Name
+            Package = $packageSpec
+            Status  = $status
+        }
+        $color = if ($status -eq 'OK') { 'Green' } elseif ($status -eq 'Skipped') { 'Yellow' } else { 'Red' }
+        Write-Host ("  Result: {0}" -f $status) -ForegroundColor $color
+        Write-Host ''
+    }
+
+    # Summary table.
+    Write-Host '  Batch complete:' -ForegroundColor Cyan
+    Show-SelectableList -Items $results -Columns @(
+        @{ Header = 'Target';  Expr = { $_.Target } },
+        @{ Header = 'Package'; Expr = { $_.Package } },
+        @{ Header = 'Status';  Expr = { $_.Status } }
+    ) -NoNumber
+    Wait-Continue
+}
+
 function Invoke-PackagesMenu {
     while ($true) {
         Show-Header -Title 'Packages & workloads'
@@ -1123,6 +1423,7 @@ function Invoke-PackagesMenu {
         Write-Host '  10. Repair a package               (tcpkg repair <package>)'
         Write-Host '  11. Uninstall a package / all      (tcpkg uninstall <package>|all)'
         Write-Host '  12. Search for a package           (tcpkg list <term>)'
+        Write-Host '  13. Batch operation on targets     (install/upgrade/uninstall on multiple PCs)'
         Write-Host '   0. Back'
         Write-Host ''
         switch ((Read-Host '  Choice').Trim()) {
@@ -1240,20 +1541,32 @@ function Invoke-PackagesMenu {
             }
             '8' {
                 Write-Host ''
-                $term = Read-Value 'Search term (blank = list all available):' -AllowEmpty
-                $filter = Select-FeedFilter
-                if ($null -ne $filter) {
-                    $listArgs = @('list')
-                    if (-not [string]::IsNullOrWhiteSpace($term)) { $listArgs += $term }
-                    $listArgs += $filter
+                Write-Host '   1. Install on one target    (choose from feed)'
+                Write-Host '   2. Install on multiple targets  (batch operation)'
+                Write-Host '   0. Back'
+                Write-Host ''
+                $sub = (Read-Host '  Choice').Trim()
+                if ($sub -eq '2') {
                     Write-Host ''
-                    Invoke-PackageBrowser -ListArgs $listArgs
+                    Invoke-BatchOperation -PresetAction 'install'
+                } elseif ($sub -eq '1') {
+                    Write-Host ''
+                    $term = Read-Value 'Search term (blank = list all available):' -AllowEmpty
+                    $filter = Select-FeedFilter
+                    if ($null -ne $filter) {
+                        $listArgs = @('list')
+                        if (-not [string]::IsNullOrWhiteSpace($term)) { $listArgs += $term }
+                        $listArgs += $filter
+                        Write-Host ''
+                        Invoke-PackageBrowser -ListArgs $listArgs
+                    }
                 }
             }
             '9' {
                 Write-Host ''
-                Write-Host '   1. Choose from upgradable packages  (tcpkg list -o)'
-                Write-Host '   2. Upgrade ALL packages              (tcpkg upgrade all)'
+                Write-Host '   1. Choose from upgradable packages on one target  (tcpkg list -o)'
+                Write-Host '   2. Upgrade on multiple targets                    (batch operation)'
+                Write-Host '   3. Upgrade ALL packages on one target             (tcpkg upgrade all)'
                 Write-Host '   0. Back'
                 Write-Host ''
                 $sub = (Read-Host '  Choice').Trim()
@@ -1261,6 +1574,9 @@ function Invoke-PackagesMenu {
                     Write-Host ''
                     Invoke-PackageBrowser -ListArgs @('list','-o')
                 } elseif ($sub -eq '2') {
+                    Write-Host ''
+                    Invoke-BatchOperation -PresetAction 'upgrade'
+                } elseif ($sub -eq '3') {
                     Write-Host ''
                     $a = @('upgrade','all')
                     if (Confirm-YesNo -Prompt 'Allow downgrade (--allow-downgrade)?') { $a += '--allow-downgrade' }
@@ -1276,8 +1592,9 @@ function Invoke-PackagesMenu {
             }
             '11' {
                 Write-Host ''
-                Write-Host '   1. Choose from installed packages  (tcpkg list -i)'
-                Write-Host '   2. Uninstall ALL packages          (tcpkg uninstall all)'
+                Write-Host '   1. Choose from installed packages on one target  (tcpkg list -i)'
+                Write-Host '   2. Uninstall on multiple targets                 (batch operation)'
+                Write-Host '   3. Uninstall ALL packages on one target          (tcpkg uninstall all)'
                 Write-Host '   0. Back'
                 Write-Host ''
                 $sub = (Read-Host '  Choice').Trim()
@@ -1286,7 +1603,10 @@ function Invoke-PackagesMenu {
                     Invoke-PackageBrowser -ListArgs @('list','-i')
                 } elseif ($sub -eq '2') {
                     Write-Host ''
-                    Write-Host '  This removes ALL TwinCAT packages from this machine.' -ForegroundColor Red
+                    Invoke-BatchOperation -PresetAction 'uninstall'
+                } elseif ($sub -eq '3') {
+                    Write-Host ''
+                    Write-Host '  This removes ALL TwinCAT packages from the selected machine.' -ForegroundColor Red
                     if (Confirm-YesNo -Prompt 'Are you sure you want to uninstall everything?') {
                         $a = @('uninstall','all')
                         if (Confirm-YesNo -Prompt 'Unattended (-y)?') { $a += '-y' }
@@ -1318,21 +1638,19 @@ function Invoke-PackagesMenu {
                     }
                 }
             }
+            '13' { Write-Host ''; Invoke-BatchOperation }
             '0' { return }
             default { Write-Host '  Unknown choice.' -ForegroundColor Yellow; Start-Sleep -Milliseconds 700 }
         }
     }
 }
-
-# ============================================================================
-#  Sources (feeds) menu
 # ============================================================================
 
 # Run `tcpkg source list` and parse it into objects:
 #   Name, Priority, Enabled, Auth, BypassProxy, Prereleases, Take, Url
 # Prefers `--as-json` (robust against display-format changes); falls back to
 # parsing the plain-text output if the JSON can't be read. Read-only, so it
-# runs even in dry-run mode (we need real data to plan).
+# runs even in read-only mode (we need real data to plan).
 function Get-SourceList {
     if (-not (Test-TcpkgAvailable)) {
         Write-Host '  tcpkg was not found on PATH; cannot read sources.' -ForegroundColor Red
@@ -1497,7 +1815,7 @@ function Set-SourcePriorityCascade {
     $k = 0
     foreach ($c in $changes) {
         Invoke-Tcpkg -ArgList @('source', 'edit', $c.Name, "--priority=$($parkBase + $k)", '-y')
-        if ($Script:LastExit -ne 0 -and -not $Script:DryRun) {
+        if ($Script:LastExit -ne 0 -and -not $Script:ReadOnly) {
             Write-Host "  Failed to park '$($c.Name)' (exit $Script:LastExit). Aborting before final pass." -ForegroundColor Red
             Write-Host '  Some sources may be left at a temporary priority; re-run to finish.' -ForegroundColor Yellow
             return
@@ -1508,7 +1826,7 @@ function Set-SourcePriorityCascade {
     Write-Host "`n  Pass 2/2 - assigning final priorities..." -ForegroundColor DarkGray
     foreach ($c in $changes) {
         Invoke-Tcpkg -ArgList @('source', 'edit', $c.Name, "--priority=$($c.To)", '-y')
-        if ($Script:LastExit -ne 0 -and -not $Script:DryRun) {
+        if ($Script:LastExit -ne 0 -and -not $Script:ReadOnly) {
             Write-Host "  Failed to set '$($c.Name)' to priority $($c.To) (exit $Script:LastExit)." -ForegroundColor Red
         }
     }
@@ -1617,7 +1935,7 @@ function Invoke-SourcesMenu {
 # ============================================================================
 
 # Run `tcpkg config list` and parse "<Setting>: <Value>" lines into objects.
-# Read-only, so it runs even in dry-run mode.
+# Read-only, so it runs even in read-only mode.
 function Get-ConfigList {
     if (-not (Test-TcpkgAvailable)) {
         Write-Host '  tcpkg was not found on PATH; cannot read configuration.' -ForegroundColor Red
@@ -1694,7 +2012,7 @@ function Select-ConfigOption {
 # ============================================================================
 
 # Run `tcpkg remote list --as-json` and parse into objects.
-# Read-only; runs even in dry-run mode.
+# Read-only; runs even in read-only mode.
 function Get-RemoteList {
     if (-not (Test-TcpkgAvailable)) {
         Write-Host '  tcpkg was not found on PATH; cannot read remote targets.' -ForegroundColor Red
@@ -1787,6 +2105,300 @@ function Select-RemoteTarget {
     return @{ Args = @(); Label = 'local'; InternetAccess = '' }
 }
 
+
+# Export the current remote target list to a CSV file.
+# CSV columns: Name, Host, Port, User, InternetAccess
+# Passwords are NOT exported for security reasons.
+function Export-RemoteTargets {
+    $remotes = Get-RemoteList
+    if (@($remotes).Count -eq 0) {
+        Write-Host '  No remote targets to export.' -ForegroundColor Yellow
+        return
+    }
+
+    $defaultPath = Join-Path (Split-Path $PSCommandPath -Parent) 'TcPkgRemotes.csv'
+    $path = Read-Value ("CSV file path (blank = {0}):" -f $defaultPath) -AllowEmpty
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
+
+    Write-Host ''
+    Write-Host '  Include passwords in the export?' -ForegroundColor Cyan
+    Write-Host '   1. No  — passwords omitted (recommended)'
+    Write-Host '   2. Yes — passwords stored in plain text (use with caution)'
+    Write-Host ''
+    $pwChoice = (Read-Host '  Choice').Trim()
+
+    $plainPwd = $null
+    if ($pwChoice -eq '2') {
+        Write-Host ''
+        Write-Host '  Warning: passwords will be stored as plain text in the CSV.' -ForegroundColor Yellow
+        Write-Host '  Ensure the file is kept secure and not shared publicly.' -ForegroundColor Yellow
+        Write-Host ''
+        $securePwd = Read-Host '  Password to embed in CSV (single password for all targets)' -AsSecureString
+        $plainPwd  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePwd))
+    }
+
+    try {
+        $rows = $remotes | ForEach-Object {
+            $obj = [ordered]@{
+                Name           = $_.Name
+                Host           = $_.Host
+                Port           = $_.Port
+                User           = $_.User
+                InternetAccess = $_.InternetAccess
+                Password       = if ($plainPwd) { $plainPwd } else { '' }
+            }
+            [pscustomobject]$obj
+        }
+        $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+        Write-Host ("  Exported {0} target(s) to:" -f @($remotes).Count) -ForegroundColor Green
+        Write-Host "    $path" -ForegroundColor White
+        if (-not $plainPwd) {
+            Write-Host '  Password column is empty — you will be prompted during import.' -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host ("  Failed to export: {0}" -f $_) -ForegroundColor Red
+    }
+}
+
+# Import remote targets from a CSV file.
+# Required CSV columns: Name, Host, Port, User, InternetAccess
+# Optional CSV column:  Password (plain text)
+# Password strategy for new targets is chosen once before processing starts.
+function Import-RemoteTargets {
+    $defaultPath = Join-Path (Split-Path $PSCommandPath -Parent) 'TcPkgRemotes.csv'
+    $path = Read-Value ("CSV file path (blank = {0}):" -f $defaultPath) -AllowEmpty
+    if ([string]::IsNullOrWhiteSpace($path)) { $path = $defaultPath }
+
+    if (-not (Test-Path $path)) {
+        Write-Host "  File not found: $path" -ForegroundColor Red
+        return
+    }
+
+    try {
+        $rows = @(Import-Csv -Path $path -Encoding UTF8)
+    } catch {
+        Write-Host ("  Failed to read CSV: {0}" -f $_) -ForegroundColor Red
+        return
+    }
+
+    if ($rows.Count -eq 0) {
+        Write-Host '  CSV file is empty.' -ForegroundColor Yellow
+        return
+    }
+
+    # Validate required columns.
+    $required = @('Name','Host','Port','User','InternetAccess')
+    $missing  = $required | Where-Object { $_ -notin $rows[0].PSObject.Properties.Name }
+    if ($missing) {
+        Write-Host ("  CSV is missing required columns: {0}" -f ($missing -join ', ')) -ForegroundColor Red
+        Write-Host '  Expected columns: Name, Host, Port, User, InternetAccess, Password (optional)' -ForegroundColor DarkGray
+        return
+    }
+
+    $hasPwdColumn = 'Password' -in $rows[0].PSObject.Properties.Name
+
+    Write-Host ("  Found {0} target(s) in CSV." -f $rows.Count) -ForegroundColor Cyan
+    Write-Host ''
+
+    # Count how many are new (need a password) vs existing (no password needed).
+    $existingMap = @{}
+    foreach ($e in Get-RemoteList) { $existingMap[$e.Name] = $e }
+    $newCount = @($rows | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_.Name) -and
+        -not $existingMap.ContainsKey($_.Name.Trim())
+    }).Count
+
+    # Choose password strategy for new targets.
+    $pwStrategy = 'per-target'   # default
+    $sharedPwd  = $null
+
+    if ($newCount -gt 0) {
+        Write-Host ("  {0} new target(s) will be added and require an SSH password." -f $newCount) -ForegroundColor Cyan
+        Write-Host ''
+        if ($hasPwdColumn) {
+            Write-Host '  Password source:'
+            Write-Host '   1. Use Password column from CSV'
+            Write-Host '   2. Enter one shared password for all new targets'
+            Write-Host '   3. Prompt individually for each new target'
+        } else {
+            Write-Host '  Password source (no Password column in CSV):'
+            Write-Host '   1. Enter one shared password for all new targets'
+            Write-Host '   2. Prompt individually for each new target'
+        }
+        Write-Host ''
+        $pwChoice = (Read-Host '  Choice').Trim()
+
+        if ($hasPwdColumn) {
+            switch ($pwChoice) {
+                '1' { $pwStrategy = 'csv' }
+                '2' {
+                    $pwStrategy = 'shared'
+                    $secure = Read-Host '  Shared SSH password' -AsSecureString
+                    $sharedPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                                     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+                }
+                default { $pwStrategy = 'per-target' }
+            }
+        } else {
+            switch ($pwChoice) {
+                '1' {
+                    $pwStrategy = 'shared'
+                    $secure = Read-Host '  Shared SSH password' -AsSecureString
+                    $sharedPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                                     [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure))
+                }
+                default { $pwStrategy = 'per-target' }
+            }
+        }
+        Write-Host ''
+    }
+
+    $added = 0; $skipped = 0; $updated = 0; $failed = 0
+    $skipUnreachable = Confirm-YesNo -Prompt 'Automatically skip targets that cannot be reached on their SSH port?'
+    Write-Host ''
+
+    foreach ($row in $rows) {
+        $name = $row.Name.Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+
+        if ($existingMap.ContainsKey($name)) {
+            $current   = $existingMap[$name]
+            $csvAccess = $row.InternetAccess.Trim()
+            $csvHost   = $row.Host.Trim()
+            $csvPort   = $row.Port.Trim()
+
+            # Collect only the properties that have actually changed.
+            $editArgs = @('remote','edit',$name)
+            $changes  = @()
+            if ($csvHost -and $csvHost -ne $current.Host) {
+                $editArgs += @('--host',$csvHost)
+                $changes  += ("Host: {0} -> {1}" -f $current.Host, $csvHost)
+            }
+            if ($csvPort -and $csvPort -ne $current.Port) {
+                $editArgs += @('--port',$csvPort)
+                $changes  += ("Port: {0} -> {1}" -f $current.Port, $csvPort)
+            }
+            if ($csvAccess -and $csvAccess -ne $current.InternetAccess) {
+                $editArgs += @('--internet-access',$csvAccess)
+                $changes  += ("Internet Access: {0} -> {1}" -f $current.InternetAccess, $csvAccess)
+            }
+
+            if ($changes.Count -eq 0) {
+                Write-Host ("  Skipping '{0}' — already configured and up to date." -f $name) -ForegroundColor DarkGray
+                $skipped++
+            } else {
+                $editArgs += '-y'
+                Write-Host ("  Updating '{0}':" -f $name) -ForegroundColor Cyan
+                foreach ($c in $changes) { Write-Host "    $c" -ForegroundColor DarkGray }
+                Write-Command -ArgList $editArgs
+                if ($Script:ReadOnly) {
+                    Write-Host '  [read-only] command not executed.' -ForegroundColor DarkYellow
+                    $updated++
+                } else {
+                    Invoke-Tcpkg -ArgList $editArgs
+                    if ($Script:LastExit -eq 0) {
+                        Write-Host ("  '{0}' updated successfully." -f $name) -ForegroundColor Green
+                        $updated++
+                    } else {
+                        Write-Host ("  Failed to update '{0}'." -f $name) -ForegroundColor Red
+                        $failed++
+                    }
+                }
+            }
+            continue
+        }
+
+        # New target — resolve the password.
+        if ($pwStrategy -eq 'csv') {
+            $plainPwd = $row.Password
+        } elseif ($pwStrategy -eq 'shared') {
+            $plainPwd = $sharedPwd
+        } else {
+            $sec = Read-Host ("  SSH password for {0}@{1}" -f $row.User.Trim(), $row.Host.Trim()) -AsSecureString
+            $plainPwd = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec))
+        }
+
+        if ([string]::IsNullOrEmpty($plainPwd)) {
+            Write-Host ("  Skipping '{0}' — no password available." -f $name) -ForegroundColor Yellow
+            $failed++
+            continue
+        }
+
+        # Pre-check: test TCP reachability on the SSH port before attempting
+        # remote add, which always validates the SSH connection and fails with
+        # exit 1201 if the host is unreachable.
+        $portNum = [int]($row.Port.Trim())
+        Write-Host ("  Checking connectivity to {0}:{1}..." -f $row.Host.Trim(), $portNum) -ForegroundColor DarkGray
+        $connected = $false
+        try {
+            $tcp = [System.Net.Sockets.TcpClient]::new()
+            $connected = $tcp.ConnectAsync($row.Host.Trim(), $portNum).Wait(2000)
+            $tcp.Dispose()
+        } catch { $connected = $false }
+
+        if (-not $connected) {
+            Write-Host ("  Warning: '{0}' ({1}:{2}) is not reachable on port {2}." -f $name, $row.Host.Trim(), $portNum) -ForegroundColor Yellow
+            if ($skipUnreachable -or -not (Confirm-YesNo -Prompt "Attempt to add '$name' anyway?")) {
+                Write-Host ("  Skipping '{0}'." -f $name) -ForegroundColor DarkGray
+                $skipped++
+                continue
+            }
+        }
+
+        Write-Host ("  Adding '{0}' ({1}@{2}:{3})..." -f $name, $row.User.Trim(), $row.Host.Trim(), $row.Port.Trim()) -ForegroundColor Cyan
+
+        $argList = @('remote','add',
+                     '-n',    $name,
+                     '--host', $row.Host.Trim(),
+                     '--port', $row.Port.Trim(),
+                     '-u',    $row.User.Trim())
+        if ($row.InternetAccess.Trim() -eq 'True') { $argList += '--internet-access','True' }
+        $argList += '--password-stdin','-y'
+
+        Write-Command -ArgList $argList
+        if ($Script:ReadOnly) {
+            Write-Host '  [read-only] command not executed.' -ForegroundColor DarkYellow
+            $added++
+        } else {
+            $prev = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
+            $plainPwd | & $Script:TcpkgExe @argList 2>&1 | ForEach-Object {
+                if ($_ -is [System.Management.Automation.ErrorRecord]) { Write-Host ([string]$_) -ForegroundColor Red }
+                else { Write-Host ([string]$_) }
+            }
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = $prev
+            if ($code -eq 0) {
+                Write-Host ("  '{0}' added successfully." -f $name) -ForegroundColor Green
+                $added++
+            } else {
+                Write-Host ("  Failed to add '{0}' (exit {1})." -f $name, $code) -ForegroundColor Red
+                $failed++
+            }
+        }
+        Write-Host ''
+    }
+
+    Write-Host ('  Import complete: {0} added, {1} updated, {2} skipped, {3} failed.' -f $added, $updated, $skipped, $failed) -ForegroundColor $(
+        if ($failed -gt 0) { 'Yellow' } else { 'Green' }
+    )
+
+    # Refresh the display so the updated list is visible.
+    if (($added -gt 0 -or $updated -gt 0) -and -not $Script:ReadOnly) {
+        Write-Host ''
+        Write-Host '  Updated remote target list:' -ForegroundColor Cyan
+        $refreshed = Get-RemoteList
+        Show-SelectableList -Items $refreshed -Columns @(
+            @{ Header = 'Name';            Expr = { $_.Name } },
+            @{ Header = 'Host';            Expr = { $_.Host } },
+            @{ Header = 'Port';            Expr = { $_.Port };            Align = 'Right' },
+            @{ Header = 'User';            Expr = { $_.User } },
+            @{ Header = 'Internet Access'; Expr = { $_.InternetAccess } }
+        ) -NoNumber
+    }
+}
+
 function Invoke-RemoteMenu {
     while ($true) {
         Show-Header -Title 'Remote targets'
@@ -1795,6 +2407,8 @@ function Invoke-RemoteMenu {
         Write-Host '   3. Add a remote target            (tcpkg remote add ...)'
         Write-Host '   4. Edit a remote target           (tcpkg remote edit <name> ...)'
         Write-Host '   5. Remove a remote target         (tcpkg remote remove <name>)'
+        Write-Host '   6. Export targets to CSV'
+        Write-Host '   7. Import targets from CSV'
         Write-Host '   0. Back'
         Write-Host ''
         switch ((Read-Host '  Choice').Trim()) {
@@ -1854,8 +2468,8 @@ function Invoke-RemoteMenu {
                 }
                 Write-Host ''
                 Write-Command -ArgList ($argList + @('-y'))
-                if ($Script:DryRun) {
-                    Write-Host '  [dry-run] command not executed.' -ForegroundColor DarkYellow
+                if ($Script:ReadOnly) {
+                    Write-Host '  [read-only] command not executed.' -ForegroundColor DarkYellow
                 } else {
                     if ($argList -contains '--password-stdin') {
                         # -y suppresses the fingerprint trust confirmation.
@@ -1903,8 +2517,8 @@ function Invoke-RemoteMenu {
                     $argList += '-y'
                     Write-Host ''
                     Write-Command -ArgList $argList
-                    if ($Script:DryRun) {
-                        Write-Host '  [dry-run] command not executed.' -ForegroundColor DarkYellow
+                    if ($Script:ReadOnly) {
+                        Write-Host '  [read-only] command not executed.' -ForegroundColor DarkYellow
                     } else {
                         $prev = $ErrorActionPreference; $ErrorActionPreference = 'SilentlyContinue'
                         if ($argList -contains '--password-stdin') {
@@ -1929,6 +2543,8 @@ function Invoke-RemoteMenu {
                 }
                 Wait-Continue
             }
+            '6' { Write-Host ''; Export-RemoteTargets; Wait-Continue }
+            '7' { Write-Host ''; Import-RemoteTargets; Wait-Continue }
             '0' { return }
             default { Write-Host '  Unknown choice.' -ForegroundColor Yellow; Start-Sleep -Milliseconds 700 }
         }
@@ -1937,7 +2553,6 @@ function Invoke-RemoteMenu {
 
 function Invoke-ConfigMenu {
     while ($true) {
-        Show-Header -Title 'Configuration'
         Write-Host '   1. View configuration   (tcpkg config list)'
         Write-Host '   2. Set an option        (tcpkg config set -n <opt> [-v <value>])'
         Write-Host '   3. Unset an option      (tcpkg config unset -n <opt>)'
@@ -2112,8 +2727,8 @@ function Search-NupkgFiles {
     $sel = Read-Host "`n  Number to open folder (blank to skip)"
     if ($sel -match '^\d+$' -and [int]$sel -ge 1 -and [int]$sel -le $uniquePkgs.Count) {
         $folder = Split-Path -Parent $uniquePkgs[[int]$sel - 1].NupkgPath
-        if ($Script:DryRun) {
-            Write-Host "  [dry-run] explorer.exe '$folder'" -ForegroundColor DarkYellow
+        if ($Script:ReadOnly) {
+            Write-Host "  [read-only] explorer.exe '$folder'" -ForegroundColor DarkYellow
         } else {
             Start-Process explorer.exe -ArgumentList $folder
         }
@@ -2198,16 +2813,13 @@ function Invoke-FeedFileSearch {
     Write-Host '  Which packages do you want to search inside?' -ForegroundColor Cyan
     Show-SelectableList -Items $res.Items -Columns $res.Columns
     Write-Host ''
-    Write-Host '  Enter numbers separated by commas, or blank to cancel' -ForegroundColor DarkGray
+    Write-Host '  Enter numbers or ranges (e.g. 1,3,5..8), or blank to cancel' -ForegroundColor DarkGray
     $raw = (Read-Host '  Choice').Trim()
     if ([string]::IsNullOrWhiteSpace($raw)) { return }
 
     $selections = @()
-    foreach ($part in ($raw -split ',')) {
-        $n = $part.Trim()
-        if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le @($res.Items).Count) {
-            $selections += $res.Items[[int]$n - 1]
-        }
+    foreach ($idx in (Expand-SelectionRange -RawInput $raw -Max @($res.Items).Count)) {
+        $selections += $res.Items[$idx - 1]
     }
     if ($selections.Count -eq 0) {
         Write-Host '  No valid selections.' -ForegroundColor Yellow
@@ -2301,23 +2913,31 @@ function Start-TcPkgConsole {
 
     if (-not (Test-TcpkgAvailable)) {
         Write-Host 'Warning: tcpkg was not found on PATH.' -ForegroundColor Yellow
-        Write-Host 'You can still explore the menus; dry-run mode will show what commands would run.' -ForegroundColor Yellow
+        Write-Host 'You can still explore the menus; read-only mode will show what commands would run.' -ForegroundColor Yellow
         Start-Sleep -Seconds 2
     }
 
-    # Show the dry-run explanation on first launch.
+    # Show the read-only explanation on first launch.
     Show-Header -Title 'Welcome'
-    Write-Host '  Dry-run mode is ON.' -ForegroundColor Yellow
+    Write-Host '  Read-only mode is ON.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  In dry-run mode, no tcpkg commands are actually executed.' -ForegroundColor Cyan
-    Write-Host '  Instead, each command is displayed as it would be run, for example:' -ForegroundColor Cyan
+    Write-Host '  In read-only mode, no commands that make changes are executed.' -ForegroundColor Cyan
+    Write-Host '  This includes install, upgrade, repair, uninstall, and all configuration' -ForegroundColor Cyan
+    Write-Host '  changes such as adding/editing feeds, remote targets, or settings.' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '    [dry-run] tcpkg install twincat.standard.xae=4026.23.1 -r DCC-2 -y' -ForegroundColor DarkYellow
+    Write-Host '  Instead, the exact tcpkg command that would be issued is displayed, e.g.:' -ForegroundColor Cyan
     Write-Host ''
-    Write-Host '  This lets you explore the menus, understand what each option does,' -ForegroundColor Cyan
-    Write-Host '  and verify the correct command will be issued before anything changes.' -ForegroundColor Cyan
+    Write-Host '    [read-only] tcpkg install twincat.standard.xae=4026.23.1 -r DCC-2 -y' -ForegroundColor DarkYellow
     Write-Host ''
-    Write-Host '  To make real changes, select option 8 on the main menu to turn dry-run OFF.' -ForegroundColor Cyan
+    Write-Host '  Use read-only mode to:' -ForegroundColor Cyan
+    Write-Host '   - Explore the menus and understand what each option does' -ForegroundColor Cyan
+    Write-Host '   - Verify the correct command will be issued before making any changes' -ForegroundColor Cyan
+    Write-Host '   - Learn tcpkg syntax without risk of modifying your system' -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Commands that always run (read-only data, used to populate menus):' -ForegroundColor DarkGray
+    Write-Host '   tcpkg list, source list, config list, remote list' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  To make real changes, select option 8 on the main menu to turn read-only OFF.' -ForegroundColor Cyan
     Write-Host ''
     Wait-Continue
 
@@ -2330,8 +2950,8 @@ function Start-TcPkgConsole {
         Write-Host '   5. Remote targets'
         Write-Host '   6. Search files in local packages'
         Write-Host '   7. Search files in feed packages'
-        $dryLabel = if ($Script:DryRun) { 'ON  — commands shown but not executed' } else { 'OFF — commands will execute' }
-        Write-Host ("   8. Dry-run mode: {0}" -f $dryLabel) -ForegroundColor $(if ($Script:DryRun) { 'Yellow' } else { 'Green' })
+        $dryLabel = if ($Script:ReadOnly) { 'ON  — commands shown but not executed' } else { 'OFF — commands will execute' }
+        Write-Host ("   8. Read-only mode: {0}" -f $dryLabel) -ForegroundColor $(if ($Script:ReadOnly) { 'Yellow' } else { 'Green' })
         Write-Host '   9. Run a raw tcpkg command'
         Write-Host '   0. Exit'
         Write-Host ''
@@ -2344,11 +2964,11 @@ function Start-TcPkgConsole {
             '6' { Invoke-PackageFileSearch }
             '7' { Invoke-FeedFileSearch }
             '8' {
-                $Script:DryRun = -not $Script:DryRun
-                if ($Script:DryRun) {
-                    Write-Host '  Dry-run mode ON  — commands will be shown but not executed.' -ForegroundColor Yellow
+                $Script:ReadOnly = -not $Script:ReadOnly
+                if ($Script:ReadOnly) {
+                    Write-Host '  Read-only mode ON  — commands will be shown but not executed.' -ForegroundColor Yellow
                 } else {
-                    Write-Host '  Dry-run mode OFF — commands will execute and make real changes.' -ForegroundColor Green
+                    Write-Host '  Read-only mode OFF — commands will execute and make real changes.' -ForegroundColor Green
                 }
                 Start-Sleep -Milliseconds 1200
             }
